@@ -14,6 +14,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -27,10 +28,58 @@ type AgentData struct {
 }
 
 func main() {
-	keyFile := "keys.json"
-	dataFile := "agent-data.json"
-	serverSpiffeID := "spiffe://example.org/target-service"
-	apiURL := "https://api.example.org/v1/data"
+	trustDomain := os.Getenv("SPIFFE_TRUST_DOMAIN")
+	keyFile := os.Getenv("KEYFILE")
+	dataFile := os.Getenv("DATAFILE")
+	serverSpiffeID := os.Getenv("SERVERSPIFFEID")
+	apiURL := os.Getenv("APIURL")
+	apiPort := os.Getenv("APIPORT")
+	tokenFile := os.Getenv("TOKENFILE")
+
+	if trustDomain == "" {
+		log.Printf("You must specify the trust domain")
+		os.Exit(1)
+	}
+	if apiURL == ""  {
+		log.Printf("You must specify the server api url")
+		os.Exit(1)
+	}
+	if tokenFile == "" {
+		log.Printf("You must specify the token file")
+		os.Exit(1)
+	}
+
+	if serverSpiffeID == "" {
+		serverSpiffeID = "spire-controller-manager-dynamic-registration"
+	}
+	if !strings.HasPrefix(serverSpiffeID, "/") && !strings.HasPrefix(serverSpiffeID, "spiffe://") {
+		serverSpiffeID = "/" + serverSpiffeID
+	}
+	if !strings.HasPrefix(serverSpiffeID, "spiffe://") {
+		serverSpiffeID = "spiffe://" + serverSpiffeID
+	}
+
+	if !strings.HasPrefix(apiURL, "https://") {
+		apiURL = "https://" + apiURL
+	}
+	if !strings.Contains(apiURL, ".") {
+		apiURL += "." + trustDomain
+	}
+	if apiPort != "" && !strings.Contains(apiURL,":") {
+		apiURL += ":" + apiPort
+	}
+	if !strings.HasSuffix(apiURL, "/") {
+		apiURL += "/"
+	}
+	apiURL += "v1/register-node"
+
+	if keyFile == "" {
+		keyFile = "/var/lib/spire/keys.json"
+	}
+
+	if dataFile == "" {
+		dataFile = "/var/lib/spire/agent-data.json"
+	}
 
 	for {
 		log.Println("--- Attempting to refresh credentials ---")
@@ -66,14 +115,33 @@ func main() {
 
 		log.Printf("Making request to %s...", apiURL)
 		//FIXME load token from disk.
-		err = performRequest(client, apiURL, "token")
-		if err == nil {
-			log.Printf("Successfully uploaded. Sleeping forever")
-			select {}
+		token, err := loadProjectedToken(tokenFile)
+		if err != nil {
+			log.Printf("Failed to read token")
+		} else {
+			err = performRequest(client, apiURL, token)
+			if err == nil {
+				log.Printf("Successfully uploaded. Sleeping forever")
+				select {}
+			}
 		}
 
 		time.Sleep(10 * time.Second)
 	}
+}
+
+func loadProjectedToken(tokenFile string) (string, error) {
+	data, err := os.ReadFile(tokenFile)
+	if err != nil {
+		return "", fmt.Errorf("failed to read projected token file %q: %w", tokenFile, err)
+	}
+
+	token := strings.TrimSpace(string(data))
+	if token == "" {
+		return "", fmt.Errorf("projected token file %q was empty", tokenFile)
+	}
+
+	return token, nil
 }
 
 func loadCredentials(keyPath string, dataPath string) (tls.Certificate, *x509.CertPool, error) {
