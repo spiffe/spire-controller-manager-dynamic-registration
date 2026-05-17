@@ -27,6 +27,8 @@ type AgentData struct {
 	Bundle []string `json:"bundle"`
 }
 
+//FIXME add a healthcheck for upload finished ok.
+
 func main() {
 	trustDomain := os.Getenv("SPIFFE_TRUST_DOMAIN")
 	keyFile := os.Getenv("KEYFILE")
@@ -55,13 +57,13 @@ func main() {
 	if !strings.HasPrefix(serverSpiffeID, "/") && !strings.HasPrefix(serverSpiffeID, "spiffe://") {
 		serverSpiffeID = "/" + serverSpiffeID
 	}
+	if !strings.HasPrefix(serverSpiffeID, "spiffe://") && strings.HasPrefix(serverSpiffeID, "/") {
+		serverSpiffeID = trustDomain + serverSpiffeID
+	}
 	if !strings.HasPrefix(serverSpiffeID, "spiffe://") {
 		serverSpiffeID = "spiffe://" + serverSpiffeID
 	}
 
-	if !strings.HasPrefix(apiURL, "https://") {
-		apiURL = "https://" + apiURL
-	}
 	if !strings.Contains(apiURL, ".") {
 		apiURL += "." + trustDomain
 	}
@@ -72,6 +74,9 @@ func main() {
 		apiURL += "/"
 	}
 	apiURL += "v1/register-node"
+	if !strings.HasPrefix(apiURL, "https://") {
+		apiURL = "https://" + apiURL
+	}
 
 	if keyFile == "" {
 		keyFile = "/var/lib/spire/keys.json"
@@ -94,11 +99,27 @@ func main() {
 		tlsConfig := &tls.Config{
 			Certificates: []tls.Certificate{clientCert},
 			RootCAs:      bundlePool,
+			InsecureSkipVerify: true, // OK because we verify by SPIFFEID below.
 			VerifyConnection: func(cs tls.ConnectionState) error {
+				opts := x509.VerifyOptions{
+					Roots:         bundlePool,
+					CurrentTime:   time.Now(),
+					Intermediates: x509.NewCertPool(),
+				}
+
+				for _, cert := range cs.PeerCertificates[1:] {
+					opts.Intermediates.AddCert(cert)
+				}
+
 				if len(cs.PeerCertificates) == 0 {
 					return fmt.Errorf("no server certificates provided")
 				}
 				leaf := cs.PeerCertificates[0]
+
+				if _, err := leaf.Verify(opts); err != nil {
+					return fmt.Errorf("failed to verify certificate chain: %w", err)
+				}
+
 				for _, uri := range leaf.URIs {
 					if uri.String() == serverSpiffeID {
 						return nil
@@ -114,7 +135,6 @@ func main() {
 		}
 
 		log.Printf("Making request to %s...", apiURL)
-		//FIXME load token from disk.
 		token, err := loadProjectedToken(tokenFile)
 		if err != nil {
 			log.Printf("Failed to read token")

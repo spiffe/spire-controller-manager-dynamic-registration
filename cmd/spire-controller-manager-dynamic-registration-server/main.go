@@ -220,7 +220,7 @@ func (sm *SecurityManager) VerifyPeer(rawCerts [][]byte, verifiedChains [][]*x50
 		}
 	}
 
-	return errors.New("unauthorized client SPIFFE ID")
+	return errors.New(fmt.Sprintf("unauthorized client SPIFFE ID: %s", clientCert.URIs[0]))
 }
 
 type ServerContext struct {
@@ -264,7 +264,7 @@ func main() {
 	}
 
 	if cfg.ExpectedAudience == "" {
-		cfg.ExpectedAudience = "spire-controller-manager-node-registrar"
+		cfg.ExpectedAudience = "spire-controller-manager-dynamic-registration"
 	}
 
 	if cfg.SpireServerUDSPath == "" {
@@ -301,6 +301,7 @@ func main() {
 		}
 		cfg.AllowedIDPrefix = url.String()
 	}
+	log.Printf("Checking against %s", cfg.AllowedIDPrefix)
 
 	if cfg.EntryPrefix != "" && !strings.HasSuffix(cfg.EntryPrefix, ".") {
 		cfg.EntryPrefix += "."
@@ -429,20 +430,17 @@ func (sc *ServerContext) RegisterNodeHandler(w http.ResponseWriter, r *http.Requ
 
 	targetSpiffeID := fmt.Sprintf("spiffe://%s/k8s/agent/%s", sc.Config.TrustDomain, nodeUID)
 
-	entryReq := &entryv1.BatchCreateEntryRequest{
-		Entries: []*types.Entry{
-			{
-				Id: sc.Config.EntryPrefix + nodeUID,
-				SpiffeId: &types.SPIFFEID{TrustDomain: sc.Config.TrustDomain, Path: sc.Config.RegistrationPrefix + nodeUID},
-				ParentId: &types.SPIFFEID{TrustDomain: sc.Config.TrustDomain, Path: "/spire/server"},
-				Selectors: []*types.Selector{
-					{Type: "spiffe_id", Value: clientSpiffeID},
-				},
-			},
+	entry := &types.Entry{
+		Id: sc.Config.EntryPrefix + nodeUID,
+		SpiffeId: &types.SPIFFEID{TrustDomain: sc.Config.TrustDomain, Path: sc.Config.RegistrationPrefix + nodeUID},
+		ParentId: &types.SPIFFEID{TrustDomain: sc.Config.TrustDomain, Path: "/spire/server"},
+		Selectors: []*types.Selector{
+			{Type: "spiffe_id", Value: clientSpiffeID},
 		},
 	}
 
-	resp, err := sc.EntryClient.BatchCreateEntry(r.Context(), entryReq)
+	createReq := &entryv1.BatchCreateEntryRequest{Entries: []*types.Entry{entry}}
+	resp, err := sc.EntryClient.BatchCreateEntry(r.Context(), createReq)
 	if err != nil {
 		log.Printf("SPIRE registration failure: %v", err)
 		http.Error(w, "Failed to provision target entry", http.StatusInternalServerError)
@@ -450,6 +448,29 @@ func (sc *ServerContext) RegisterNodeHandler(w http.ResponseWriter, r *http.Requ
 	}
 
 	for _, res := range resp.Results {
+		if res.Status.Code == 6 {
+		        log.Printf("Entry %s already exists. Falling back to update...", entry.Id)
+
+			updateReq := &entryv1.BatchUpdateEntryRequest{Entries: []*types.Entry{entry}}
+			updateResp, err := sc.EntryClient.BatchUpdateEntry(r.Context(), updateReq)
+			if err != nil {
+				log.Printf("SPIRE communication failure during update: %v", err)
+				http.Error(w, "Failed to update target entry", http.StatusInternalServerError)
+				return
+			}
+
+			for _, uRes := range updateResp.Results {
+				if uRes.Status.Code != 0 {
+					log.Printf("SPIRE entry update failed: %s", uRes.Status.Message)
+					http.Error(w, "SPIRE storage engine error on update", http.StatusInternalServerError)
+					return
+				}
+				log.Printf("Successfully updated existing SPIRE entry ID: %s", uRes.Entry.Id)
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"success"}`))
+			return
+		}
 		if res.Status.Code != 0 {
 			log.Printf("SPIRE entry creation returned error status code: %d message: %s", res.Status.Code, res.Status.Message)
 			http.Error(w, "SPIRE storage engine error", http.StatusInternalServerError)
@@ -458,7 +479,7 @@ func (sc *ServerContext) RegisterNodeHandler(w http.ResponseWriter, r *http.Requ
 		log.Printf("Successfully saved SPIRE entry ID: %s for target targetSpiffeID: %s", res.Entry.Id, targetSpiffeID)
 	}
 
-	w.WriteHeader(http.StatusCreated)
+	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(`{"status":"success"}`))
 }
 
