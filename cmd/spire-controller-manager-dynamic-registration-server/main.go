@@ -99,13 +99,8 @@ func (sm *SecurityManager) MintAndRotate(ctx context.Context) error {
 		return errors.New("spire returned an empty cert chain")
 	}
 
-	leafCert, err := x509.ParseCertificate(resp.Svid.CertChain[0])
-	if err != nil {
-		return fmt.Errorf("failed to parse leaf cert: %w", err)
-	}
-
 	tlsCert := &tls.Certificate{
-		Certificate: [][]byte{leafCert.Raw},
+		Certificate: resp.Svid.CertChain,
 		PrivateKey:  sm.privateKey,
 	}
 
