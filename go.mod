@@ -3,6 +3,7 @@ module github.com/spiffe/spire-controller-manager-dynamic-registration
 go 1.26.0
 
 require (
+	github.com/spiffe/go-spiffe/v2 v2.6.0
 	github.com/spiffe/spire-api-sdk v1.14.6
 	google.golang.org/grpc v1.81.1
 	k8s.io/api v0.36.1

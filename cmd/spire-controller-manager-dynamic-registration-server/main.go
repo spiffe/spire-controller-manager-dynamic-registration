@@ -28,6 +28,8 @@ import (
 	svidv1 "github.com/spiffe/spire-api-sdk/proto/spire/api/server/svid/v1"
 	"github.com/spiffe/spire-api-sdk/proto/spire/api/types"
 
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
+
 	authenticationv1 "k8s.io/api/authentication/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -125,6 +127,7 @@ func (sm *SecurityManager) FetchAndApplyTrustBundle(ctx context.Context) error {
 	rootPool := x509.NewCertPool()
 	for _, rootCertRaw := range bundle.X509Authorities {
 		if bCert, err := x509.ParseCertificate(rootCertRaw.Asn1); err == nil {
+			log.Printf("Loaded Trust Root: %s", bCert.Subject.String())
 			rootPool.AddCert(bCert)
 		}
 	}
@@ -180,42 +183,52 @@ func (sm *SecurityManager) GetCertificate(*tls.ClientHelloInfo) (*tls.Certificat
 	return sm.tlsCert, nil
 }
 
-func (sm *SecurityManager) VerifyPeer(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+func (sm *SecurityManager) GetRoots() *x509.CertPool {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
+	return sm.x509Roots
+}
 
+func (sm *SecurityManager) VerifyPeer(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
 	if len(rawCerts) == 0 {
-		return errors.New("client certificate required")
+		return errors.New("client certificate required but none presented")
 	}
 
-	clientCert, err := x509.ParseCertificate(rawCerts[0])
+	leaf, err := x509.ParseCertificate(rawCerts[0])
 	if err != nil {
-		return fmt.Errorf("failed to parse client certificate: %w", err)
+		return fmt.Errorf("failed to parse client leaf certificate: %w", err)
 	}
 
-	if sm.x509Roots == nil {
-		return errors.New("mTLS root validation pool is not initialized yet")
+	intermediates := x509.NewCertPool()
+	for i := 1; i < len(rawCerts); i++ {
+		if cert, err := x509.ParseCertificate(rawCerts[i]); err == nil {
+			intermediates.AddCert(cert)
+		}
 	}
 
 	opts := x509.VerifyOptions{
-		Roots:       sm.x509Roots,
-		KeyUsages:   []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
-		CurrentTime: time.Now(),
-	}
-	if _, err := clientCert.Verify(opts); err != nil {
-		return fmt.Errorf("failed to verify client certificate chain: %w", err)
+		Roots:         sm.GetRoots(),
+		Intermediates: intermediates,
+		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 	}
 
-	for _, u := range clientCert.URIs {
-		if u.Scheme == "spiffe" {
-			spiffeID := u.String()
-			if strings.HasPrefix(spiffeID, sm.config.AllowedIDPrefix) {
+	_, err = leaf.Verify(opts)
+	if err != nil {
+		return fmt.Errorf("client certificate chain verification failed: %w", err)
+	}
+
+	for _, u := range leaf.URIs {
+		if id, err := spiffeid.FromURI(u); err == nil {
+			if id.TrustDomain().String() == sm.config.TrustDomain && strings.HasPrefix(id.String(), sm.config.AllowedIDPrefix) {
 				return nil
 			}
 		}
 	}
 
-	return errors.New(fmt.Sprintf("unauthorized client SPIFFE ID: %s", clientCert.URIs[0]))
+	if len(leaf.URIs) > 0 {
+		return fmt.Errorf("unauthorized client SPIFFE ID: %s", leaf.URIs[0])
+	}
+	return errors.New("client certificate missing SPIFFE ID")
 }
 
 type ServerContext struct {
@@ -252,7 +265,7 @@ func main() {
 		cfg.RegistrationPrefix = "k8s/agent"
 	}
 	if !strings.HasPrefix(cfg.RegistrationPrefix, "/") {
-		cfg.RegistrationPrefix  = "/" + cfg.RegistrationPrefix
+		cfg.RegistrationPrefix = "/" + cfg.RegistrationPrefix
 	}
 	if !strings.HasSuffix(cfg.RegistrationPrefix, "/") {
 		cfg.RegistrationPrefix += "/"
@@ -270,7 +283,7 @@ func main() {
 		cfg.ServerSpiffeID = "spire-controller-manager-dynamic-registration"
 	}
 	if !strings.HasPrefix(cfg.ServerSpiffeID, "/") {
-		cfg.ServerSpiffeID  = "/" + cfg.ServerSpiffeID
+		cfg.ServerSpiffeID = "/" + cfg.ServerSpiffeID
 	}
 	if !strings.HasPrefix(cfg.ServerSpiffeID, "spiffe://") {
 		url, err := url.Parse(fmt.Sprintf("spiffe://%s%s", cfg.TrustDomain, cfg.ServerSpiffeID))
@@ -350,9 +363,14 @@ func main() {
 	mux.HandleFunc("/v1/register-node", srvCtx.RegisterNodeHandler)
 
 	tlsConfig := &tls.Config{
-		GetCertificate:        secMgr.GetCertificate,
-		ClientAuth:            tls.RequireAnyClientCert,
-		VerifyPeerCertificate: secMgr.VerifyPeer,
+		GetConfigForClient: func(hi *tls.ClientHelloInfo) (*tls.Config, error) {
+			return &tls.Config{
+				GetCertificate:        secMgr.GetCertificate,
+				ClientAuth:            tls.RequireAndVerifyClientCert,
+				ClientCAs:             secMgr.GetRoots(),
+				VerifyPeerCertificate: secMgr.VerifyPeer,
+			}, nil
+		},
 	}
 
 	server := &http.Server{
@@ -379,8 +397,8 @@ func (sc *ServerContext) RegisterNodeHandler(w http.ResponseWriter, r *http.Requ
 	}
 	var clientSpiffeID string
 	for _, u := range r.TLS.PeerCertificates[0].URIs {
-		if u.Scheme == "spiffe" {
-			clientSpiffeID = u.String()
+		if id, err := spiffeid.FromURI(u); err == nil {
+			clientSpiffeID = id.String()
 			break
 		}
 	}
@@ -426,7 +444,7 @@ func (sc *ServerContext) RegisterNodeHandler(w http.ResponseWriter, r *http.Requ
 	targetSpiffeID := fmt.Sprintf("spiffe://%s/k8s/agent/%s", sc.Config.TrustDomain, nodeUID)
 
 	entry := &types.Entry{
-		Id: sc.Config.EntryPrefix + nodeUID,
+		Id:       sc.Config.EntryPrefix + nodeUID,
 		SpiffeId: &types.SPIFFEID{TrustDomain: sc.Config.TrustDomain, Path: sc.Config.RegistrationPrefix + nodeUID},
 		ParentId: &types.SPIFFEID{TrustDomain: sc.Config.TrustDomain, Path: "/spire/server"},
 		Selectors: []*types.Selector{
@@ -444,7 +462,7 @@ func (sc *ServerContext) RegisterNodeHandler(w http.ResponseWriter, r *http.Requ
 
 	for _, res := range resp.Results {
 		if res.Status.Code == 6 {
-		        log.Printf("Entry %s already exists. Falling back to update...", entry.Id)
+			log.Printf("Entry %s already exists. Falling back to update...", entry.Id)
 
 			updateReq := &entryv1.BatchUpdateEntryRequest{Entries: []*types.Entry{entry}}
 			updateResp, err := sc.EntryClient.BatchUpdateEntry(r.Context(), updateReq)

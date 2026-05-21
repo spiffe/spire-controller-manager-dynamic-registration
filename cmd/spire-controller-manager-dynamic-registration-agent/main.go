@@ -249,8 +249,29 @@ func loadCredentials(keyPath string, dataPath string) (tls.Certificate, *x509.Ce
 
 	log.Printf("Using SVID: %s (Expires: %v)", bestCert.Subject, bestCert.NotAfter)
 
+	var certChain [][]byte
+	certChain = append(certChain, bestCert.Raw)
+
+	for _, b64Cert := range agentData.SVID {
+		raw, err := base64.StdEncoding.DecodeString(b64Cert)
+		if err != nil {
+			continue
+		}
+		cert, err := parseX509(raw)
+		if err != nil {
+			continue
+		}
+
+		if bytes.Equal(cert.Raw, bestCert.Raw) {
+			continue
+		}
+
+		log.Printf("Appending Intermediate CA to client TLS chain: %s", cert.Subject)
+		certChain = append(certChain, cert.Raw)
+	}
+
 	return tls.Certificate{
-		Certificate: [][]byte{bestCert.Raw},
+		Certificate: certChain,
 		PrivateKey:  bestPriv,
 		Leaf:        bestCert,
 	}, bundlePool, nil
